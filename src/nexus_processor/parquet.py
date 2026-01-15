@@ -420,10 +420,21 @@ def extract_events(h5file: h5py.File, entry_name: str = 'entry',
                     if max_events and n_events > max_events:
                         n_events = max_events
                     
+                    # Build pulse_index mapping from event_index
+                    # event_index[i] is the starting index of events for pulse i
+                    pulse_indices = None
+                    if event_index is not None and len(event_index) > 0:
+                        pulse_indices = np.zeros(len(event_ids), dtype=np.int64)
+                        for pulse_idx in range(len(event_index)):
+                            start_idx = event_index[pulse_idx]
+                            end_idx = event_index[pulse_idx + 1] if pulse_idx + 1 < len(event_index) else len(event_ids)
+                            pulse_indices[start_idx:end_idx] = pulse_idx
+                    
                     for i in range(n_events):
                         record = {
                             'bank': key,
                             'event_idx': i,
+                            'pulse_index': int(pulse_indices[i]) if pulse_indices is not None else None,
                             'event_id': int(event_ids[i]),
                             'time_offset': float(event_offsets[i]),
                         }
@@ -584,7 +595,7 @@ def _save_combined_parquet(
             if col in df_daslogs.columns:
                 df_daslogs[col] = df_daslogs[col].apply(normalize_to_string)
         # Ensure event columns exist as NULL for daslogs
-        for col in ['bank', 'event_idx', 'event_id', 'time_offset']:
+        for col in ['bank', 'event_idx', 'pulse_index', 'event_id', 'time_offset']:
             if col not in df_daslogs.columns:
                 df_daslogs[col] = None
         dataframes.append(df_daslogs)
@@ -620,7 +631,7 @@ def _save_combined_parquet(
             'log_name': None, 'device_name': None, 'device_id': None,
             'time': None, 'value': None, 'value_numeric': None,
             'average_value': None, 'min_value': None, 'max_value': None,
-            'bank': None, 'event_idx': None, 'event_id': None, 'time_offset': None,
+            'bank': None, 'event_idx': None, 'pulse_index': None, 'event_id': None, 'time_offset': None,
         }])
     
     # Add metadata columns as nested structs

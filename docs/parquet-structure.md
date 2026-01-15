@@ -123,6 +123,7 @@ Neutron detector event data with one row per detected neutron. One file per dete
 | `run_number` | int64 | Run number (partition key) |
 | `bank` | large_string | Detector bank name (e.g., "bank1_events") |
 | `event_idx` | int64 | Event index within the bank |
+| `pulse_index` | int64 | Pulse index (correlates to proton_charge daslog) |
 | `event_id` | int64 | Detector pixel ID |
 | `time_offset` | float64 | Time offset within pulse (microseconds) |
 
@@ -175,6 +176,7 @@ Combined file with all data. Each row is either a DAS log entry or an event.
 |--------|------|-------------|
 | `bank` | large_string | Detector bank name |
 | `event_idx` | int64 | Event index |
+| `pulse_index` | int64 | Pulse index (correlates to proton_charge daslog) |
 | `event_id` | int64 | Detector pixel ID |
 | `time_offset` | float64 | Time offset (microseconds) |
 
@@ -254,6 +256,34 @@ FROM nexus_combined
 WHERE run_number = 12345
 LIMIT 1;
 ```
+
+---
+
+## Extracting Events by Time Window
+
+The `pulse_index` column in event data correlates to the `proton_charge` daslog, which records the wall-clock time of each neutron pulse. This enables time-based event filtering.
+
+Use the `scripts/extract_events_by_time.py` script:
+
+```bash
+# Extract events in 60-second intervals
+python scripts/extract_events_by_time.py data_combined.parquet --interval 60
+
+# Extract events from a specific time range (30-90 seconds)
+python scripts/extract_events_by_time.py data_combined.parquet --start 30 --end 90
+
+# Summary only (no file output)
+python scripts/extract_events_by_time.py data_combined.parquet --interval 60 --summary
+
+# Filter to a specific detector bank
+python scripts/extract_events_by_time.py data_combined.parquet --interval 60 --bank bank1_events
+```
+
+The script:
+1. Reads pulse times from the `proton_charge` daslog
+2. Correlates each event's `pulse_index` to its pulse time
+3. Calculates absolute time: `pulse_time + time_offset/1e6`
+4. Filters/labels events by time window
 
 ---
 

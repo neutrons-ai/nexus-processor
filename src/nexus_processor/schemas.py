@@ -120,6 +120,7 @@ EVENTS_SCHEMA = pa.schema([
     _field("run_number", pa.int64(), "Run number (partition key)"),
     _field("bank", pa.large_string(), "Detector bank name"),
     _field("event_idx", pa.int64(), "Event index within the bank"),
+    _field("pulse_index", pa.int64(), "Pulse index (correlates to proton_charge daslog)"),
     _field("event_id", pa.int64(), "Detector pixel ID"),
     _field("time_offset", pa.float64(), "Time offset within pulse (microseconds)"),
 ])
@@ -157,6 +158,7 @@ COMBINED_SCHEMA = pa.schema([
     # Event columns (NULL for daslogs)
     _field("bank", pa.large_string(), "Detector bank name"),
     _field("event_idx", pa.int64(), "Event index within the bank"),
+    _field("pulse_index", pa.int64(), "Pulse index (correlates to proton_charge daslog)"),
     _field("event_id", pa.int64(), "Detector pixel ID"),
     _field("time_offset", pa.float64(), "Time offset within pulse (microseconds)"),
     

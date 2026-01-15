@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexus-processor"
+version = "0.1.0"
+description = "Convert Nexus HDF5 files to Parquet"
+authors = [{name = "Oak Ridge National Laboratory"}]
+license = {text = "BSD-3-Clause"}
+dependencies = [
+    "h5py",
+    "pandas",
+    "pyarrow",
+    "click"
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+nexus-processor = "nexus_processor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["src/nexus_processor"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]

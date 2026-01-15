@@ -40,8 +40,13 @@ from nexus_processor.parquet import process_nexus_file
     default=None,
     help='Maximum number of events to extract per bank (default: all)',
 )
+@click.option(
+    '--single-file/--split-files',
+    default=False,
+    help='Combine all non-event data into a single parquet file (default: separate files)',
+)
 def main(input_file: str, output_dir: str, include_events: bool, 
-         include_users: bool, max_events: int) -> None:
+         include_users: bool, max_events: int, single_file: bool) -> None:
     """
     Convert NeXus HDF5 files to Parquet format.
 
@@ -54,6 +59,7 @@ def main(input_file: str, output_dir: str, include_events: bool,
       nexus-processor ~/data/REF_L_218389.nxs.h5 --include-events
       nexus-processor ~/data/REF_L_218389.nxs.h5 --include-events --max-events 100000
       nexus-processor ~/data/REF_L_218389.nxs.h5 --include-users
+      nexus-processor ~/data/REF_L_218389.nxs.h5 --single-file
     """
     # Determine output directory
     if output_dir is None:
@@ -70,6 +76,7 @@ def main(input_file: str, output_dir: str, include_events: bool,
             max_events=max_events,
             include_events=include_events,
             include_users=include_users,
+            single_file=single_file,
         )
     except Exception as e:
         click.echo(f"Error processing file: {e}", err=True)

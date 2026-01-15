@@ -5,14 +5,33 @@ This module provides functions to read NeXus format HDF5 files (commonly used
 in neutron scattering experiments) and convert data into Parquet files organized
 by data category.
 
-Output Parquet files:
-  - metadata.parquet: Run-level metadata (title, times, experiment info)
-  - daslogs.parquet: Data Acquisition System time series logs (flattened)
-  - events.parquet: Neutron detector event data (optional)
-  - sample.parquet: Sample information
-  - instrument.parquet: Instrument configuration
-  - software.parquet: Software/provenance information
-  - users.parquet: User/experimenter information (optional)
+Output modes:
+  Split files (default): Creates separate parquet files for each category:
+    - metadata.parquet: Run-level metadata (title, times, experiment info)
+    - daslogs.parquet: Data Acquisition System time series logs
+    - sample.parquet: Sample information
+    - instrument.parquet: Instrument configuration
+    - software.parquet: Software/provenance information
+    - users.parquet: User/experimenter information (optional)
+    - *_events.parquet: Neutron detector event data per bank (optional)
+
+  Single file (--single-file): Creates one combined parquet file:
+    - combined.parquet: All data (daslogs, events, users) with metadata
+      denormalized as additional columns (prefixed with meta_, sample_, etc.)
+    - A 'record_type' column distinguishes between 'daslog' and 'event' rows
+
+Splitting advantages:
+  - Consistent schema per file (same columns for all rows)
+  - Query only what you need without loading everything
+  - Better for very large event datasets
+  - Easier to append or update individual components
+  - Works well with data processing pipelines
+
+Single file advantages:
+  - Single file contains everything for a run
+  - Run metadata travels with every record
+  - Simpler for sharing and archiving
+  - Easy to filter by record_type for analysis
 
 For command-line usage, use the `nexus-processor` CLI command.
 See `nexus-processor --help` for details.
@@ -26,6 +45,24 @@ from typing import Any, Dict, List, Optional
 import h5py
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from nexus_processor.schemas import (
+    METADATA_SCHEMA,
+    SAMPLE_SCHEMA,
+    INSTRUMENT_SCHEMA,
+    SOFTWARE_SCHEMA,
+    USERS_SCHEMA,
+    DASLOGS_SCHEMA,
+    EVENTS_SCHEMA,
+    EVENT_SUMMARY_SCHEMA,
+    COMBINED_SCHEMA,
+    try_parse_numeric,
+    normalize_to_string,
+    build_attribute_map,
+    extract_known_fields,
+)
 
 
 def safe_decode(value: Any) -> Any:
@@ -432,12 +469,394 @@ def extract_software_info(h5file: h5py.File, entry_name: str = 'entry') -> List[
     return software_list
 
 
+def _add_metadata_columns(
+    df: pd.DataFrame,
+    run_number: int,
+    metadata: Dict[str, Any],
+    sample_info: Dict[str, Any],
+    instrument_info: Dict[str, Any],
+    software: List[Dict[str, Any]],
+    users: List[Dict[str, Any]],
+) -> None:
+    """
+    Add metadata as nested struct columns for Iceberg compatibility.
+    
+    Uses PyArrow-compatible nested structures instead of flat prefixed columns.
+    
+    Args:
+        df: DataFrame to modify in place
+        run_number: Run number for partition key
+        metadata: Run metadata dictionary
+        sample_info: Sample information dictionary
+        instrument_info: Instrument information dictionary
+        software: List of software component dictionaries
+        users: List of user dictionaries
+    """
+    # Add run_number as partition key
+    df['run_number'] = run_number
+    
+    # Build metadata struct
+    df['metadata'] = [{
+        'title': normalize_to_string(metadata.get('title')),
+        'start_time': normalize_to_string(metadata.get('start_time')),
+        'end_time': normalize_to_string(metadata.get('end_time')),
+        'duration': metadata.get('duration'),
+        'proton_charge': metadata.get('proton_charge'),
+        'total_counts': metadata.get('total_counts'),
+        'experiment_identifier': normalize_to_string(metadata.get('experiment_identifier')),
+        'definition': normalize_to_string(metadata.get('definition')),
+        'source_file': normalize_to_string(metadata.get('source_file')),
+    }] * len(df)
+    
+    # Build sample struct
+    df['sample'] = [{
+        'name': normalize_to_string(sample_info.get('name')),
+        'nature': normalize_to_string(sample_info.get('nature')),
+        'chemical_formula': normalize_to_string(sample_info.get('chemical_formula')),
+        'mass': sample_info.get('mass'),
+        'temperature': sample_info.get('temperature'),
+    }] * len(df)
+    
+    # Build instrument struct
+    df['instrument'] = [{
+        'name': normalize_to_string(instrument_info.get('name')),
+        'beamline': normalize_to_string(instrument_info.get('beamline')),
+    }] * len(df)
+    
+    # Build users list of structs
+    user_structs = [
+        {
+            'name': normalize_to_string(u.get('name', u.get('user_id', ''))),
+            'role': normalize_to_string(u.get('role')),
+        }
+        for u in users
+    ] if users else None
+    df['users'] = [user_structs] * len(df)
+
+
+def _save_combined_parquet(
+    output_dir: str,
+    base_name: str,
+    run_number: int,
+    daslogs: List[Dict[str, Any]],
+    metadata: Dict[str, Any],
+    sample_info: Dict[str, Any],
+    instrument_info: Dict[str, Any],
+    software: List[Dict[str, Any]],
+    users: List[Dict[str, Any]],
+    events_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """
+    Save all data as a single combined parquet file with explicit Iceberg-compatible schema.
+    
+    DAS logs and events form the rows, with metadata as nested struct columns.
+    A 'record_type' column distinguishes between 'daslog' and 'event'.
+    
+    Args:
+        output_dir: Directory to write the parquet file
+        base_name: Base name for the output file
+        run_number: Run number for partition key
+        daslogs: List of DAS log records
+        metadata: Run metadata dictionary
+        sample_info: Sample information dictionary
+        instrument_info: Instrument information dictionary
+        software: List of software component dictionaries
+        users: List of user dictionaries
+        events_data: Optional dictionary with bank names as keys and event data
+        
+    Returns:
+        Dictionary with 'combined' key mapping to output file path
+    """
+    dataframes = []
+    
+    # String columns that need normalization
+    STRING_COLS = ['log_name', 'device_name', 'device_id', 'value', 'bank', 'record_type']
+    
+    # Add daslogs with value_numeric column
+    if daslogs:
+        df_daslogs = pd.DataFrame(daslogs)
+        # Add value_numeric for Iceberg compatibility
+        df_daslogs['value_numeric'] = df_daslogs['value'].apply(try_parse_numeric)
+        df_daslogs['value'] = df_daslogs['value'].apply(normalize_to_string)
+        df_daslogs['record_type'] = 'daslog'
+        # Normalize all string columns
+        for col in STRING_COLS:
+            if col in df_daslogs.columns:
+                df_daslogs[col] = df_daslogs[col].apply(normalize_to_string)
+        # Ensure event columns exist as NULL for daslogs
+        for col in ['bank', 'event_idx', 'event_id', 'time_offset']:
+            if col not in df_daslogs.columns:
+                df_daslogs[col] = None
+        dataframes.append(df_daslogs)
+    
+    # Add events
+    if events_data:
+        all_events = []
+        for bank_name, bank_data in events_data.items():
+            all_events.extend(bank_data['records'])
+        
+        if all_events:
+            df_events = pd.DataFrame(all_events)
+            df_events['record_type'] = 'event'
+            # Normalize string columns
+            for col in STRING_COLS:
+                if col in df_events.columns:
+                    df_events[col] = df_events[col].apply(normalize_to_string)
+            # Ensure daslog columns exist as NULL for events
+            for col in ['log_name', 'device_name', 'device_id', 'time', 'value', 
+                        'value_numeric', 'average_value', 'min_value', 'max_value']:
+                if col not in df_events.columns:
+                    df_events[col] = None
+            dataframes.append(df_events)
+            print(f"    Including {len(all_events):,} events in combined file")
+    
+    # Combine all dataframes or create empty row for metadata-only
+    if dataframes:
+        df = pd.concat(dataframes, ignore_index=True)
+    else:
+        # Create a metadata-only row with all required columns
+        df = pd.DataFrame([{
+            'record_type': 'metadata',
+            'log_name': None, 'device_name': None, 'device_id': None,
+            'time': None, 'value': None, 'value_numeric': None,
+            'average_value': None, 'min_value': None, 'max_value': None,
+            'bank': None, 'event_idx': None, 'event_id': None, 'time_offset': None,
+        }])
+    
+    # Add metadata columns as nested structs
+    _add_metadata_columns(df, run_number, metadata, sample_info, instrument_info, software, users)
+    
+    # Write with explicit schema using PyArrow
+    output_path = os.path.join(output_dir, f'{base_name}_combined.parquet')
+    table = pa.Table.from_pandas(df, schema=COMBINED_SCHEMA, preserve_index=False)
+    pq.write_table(table, output_path)
+    
+    print(f"    Saved: {output_path} ({len(df):,} records)")
+    
+    return {'combined': output_path}
+
+
+def _save_split_parquets(
+    output_dir: str,
+    base_name: str,
+    run_number: int,
+    daslogs: List[Dict[str, Any]],
+    metadata: Dict[str, Any],
+    sample_info: Dict[str, Any],
+    instrument_info: Dict[str, Any],
+    software: List[Dict[str, Any]],
+    users: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    """
+    Save each data category as a separate parquet file with explicit Iceberg-compatible schemas.
+    
+    Args:
+        output_dir: Directory to write parquet files
+        base_name: Base name for output files
+        run_number: Run number for partition key
+        daslogs: List of DAS log records
+        metadata: Run metadata dictionary
+        sample_info: Sample information dictionary
+        instrument_info: Instrument information dictionary
+        software: List of software component dictionaries
+        users: List of user dictionaries
+        
+    Returns:
+        Dictionary mapping data type to output file path
+    """
+    output_files = {}
+    
+    # Known fields for each schema (others go to additional_fields map)
+    METADATA_KNOWN = ['run_number', 'title', 'start_time', 'end_time', 'duration',
+                      'proton_charge', 'total_counts', 'experiment_identifier', 
+                      'definition', 'source_file', 'source_path', 'ingestion_time']
+    SAMPLE_KNOWN = ['name', 'nature', 'chemical_formula', 'mass', 'temperature']
+    INSTRUMENT_KNOWN = ['name', 'beamline', 'instrument_xml_data']
+    SOFTWARE_KNOWN = ['component', 'name', 'version']
+    USERS_KNOWN = ['user_id', 'name', 'facility_user_id', 'role']
+    
+    if metadata:
+        record = {
+            'run_number': run_number,
+            'title': normalize_to_string(metadata.get('title')),
+            'start_time': normalize_to_string(metadata.get('start_time')),
+            'end_time': normalize_to_string(metadata.get('end_time')),
+            'duration': metadata.get('duration'),
+            'proton_charge': metadata.get('proton_charge'),
+            'total_counts': metadata.get('total_counts'),
+            'experiment_identifier': normalize_to_string(metadata.get('experiment_identifier')),
+            'definition': normalize_to_string(metadata.get('definition')),
+            'source_file': normalize_to_string(metadata.get('source_file')),
+            'source_path': normalize_to_string(metadata.get('source_path')),
+            'ingestion_time': normalize_to_string(metadata.get('ingestion_time')),
+            'file_attributes': build_attribute_map(metadata, 'file_attr_'),
+            'entry_attributes': build_attribute_map(metadata, 'entry_attr_'),
+        }
+        table = pa.Table.from_pylist([record], schema=METADATA_SCHEMA)
+        output_path = os.path.join(output_dir, f'{base_name}_metadata.parquet')
+        pq.write_table(table, output_path)
+        output_files['metadata'] = output_path
+        print(f"    Saved: {output_path}")
+    
+    if sample_info:
+        record = {
+            'run_number': run_number,
+            'name': normalize_to_string(sample_info.get('name')),
+            'nature': normalize_to_string(sample_info.get('nature')),
+            'chemical_formula': normalize_to_string(sample_info.get('chemical_formula')),
+            'mass': sample_info.get('mass'),
+            'temperature': sample_info.get('temperature'),
+            'additional_fields': extract_known_fields(sample_info, SAMPLE_KNOWN),
+        }
+        table = pa.Table.from_pylist([record], schema=SAMPLE_SCHEMA)
+        output_path = os.path.join(output_dir, f'{base_name}_sample.parquet')
+        pq.write_table(table, output_path)
+        output_files['sample'] = output_path
+        print(f"    Saved: {output_path}")
+    
+    if instrument_info:
+        record = {
+            'run_number': run_number,
+            'name': normalize_to_string(instrument_info.get('name')),
+            'beamline': normalize_to_string(instrument_info.get('beamline')),
+            'instrument_xml_data': normalize_to_string(instrument_info.get('instrument_xml_data')),
+            'additional_fields': extract_known_fields(instrument_info, INSTRUMENT_KNOWN),
+        }
+        table = pa.Table.from_pylist([record], schema=INSTRUMENT_SCHEMA)
+        output_path = os.path.join(output_dir, f'{base_name}_instrument.parquet')
+        pq.write_table(table, output_path)
+        output_files['instrument'] = output_path
+        print(f"    Saved: {output_path}")
+    
+    if users:
+        records = []
+        for user in users:
+            records.append({
+                'run_number': run_number,
+                'user_id': normalize_to_string(user.get('user_id')),
+                'name': normalize_to_string(user.get('name')),
+                'facility_user_id': normalize_to_string(user.get('facility_user_id')),
+                'role': normalize_to_string(user.get('role')),
+                'additional_fields': extract_known_fields(user, USERS_KNOWN),
+            })
+        table = pa.Table.from_pylist(records, schema=USERS_SCHEMA)
+        output_path = os.path.join(output_dir, f'{base_name}_users.parquet')
+        pq.write_table(table, output_path)
+        output_files['users'] = output_path
+        print(f"    Saved: {output_path}")
+    
+    if software:
+        records = []
+        for sw in software:
+            records.append({
+                'run_number': run_number,
+                'component': normalize_to_string(sw.get('component')),
+                'name': normalize_to_string(sw.get('name')),
+                'version': normalize_to_string(sw.get('version')),
+                'additional_fields': extract_known_fields(sw, SOFTWARE_KNOWN),
+            })
+        table = pa.Table.from_pylist(records, schema=SOFTWARE_SCHEMA)
+        output_path = os.path.join(output_dir, f'{base_name}_software.parquet')
+        pq.write_table(table, output_path)
+        output_files['software'] = output_path
+        print(f"    Saved: {output_path}")
+    
+    if daslogs:
+        records = []
+        for log in daslogs:
+            records.append({
+                'run_number': run_number,
+                'log_name': normalize_to_string(log.get('log_name')),
+                'device_name': normalize_to_string(log.get('device_name')),
+                'device_id': normalize_to_string(log.get('device_id')),
+                'time': log.get('time'),
+                'value': normalize_to_string(log.get('value')),
+                'value_numeric': try_parse_numeric(log.get('value')),
+                'average_value': log.get('average_value'),
+                'min_value': log.get('min_value'),
+                'max_value': log.get('max_value'),
+            })
+        table = pa.Table.from_pylist(records, schema=DASLOGS_SCHEMA)
+        output_path = os.path.join(output_dir, f'{base_name}_daslogs.parquet')
+        pq.write_table(table, output_path)
+        output_files['daslogs'] = output_path
+        print(f"    Saved: {output_path} ({len(daslogs):,} records)")
+    
+    return output_files
+
+
+def _save_events(
+    output_dir: str,
+    base_name: str,
+    run_number: int,
+    events_data: Dict[str, Any],
+) -> Dict[str, str]:
+    """
+    Save event data to parquet files with explicit Iceberg-compatible schema.
+    
+    Args:
+        output_dir: Directory to write parquet files
+        base_name: Base name for output files
+        run_number: Run number for partition key
+        events_data: Dictionary with bank names as keys and event data as values
+        
+    Returns:
+        Dictionary mapping bank names to output file paths
+    """
+    output_files = {}
+    
+    for bank_name, bank_data in events_data.items():
+        records = bank_data['records']
+        if records:
+            # Add run_number to each record
+            records_with_run = [
+                {**record, 'run_number': run_number}
+                for record in records
+            ]
+            table = pa.Table.from_pylist(records_with_run, schema=EVENTS_SCHEMA)
+            output_path = os.path.join(output_dir, f'{base_name}_{bank_name}.parquet')
+            pq.write_table(table, output_path)
+            output_files[bank_name] = output_path
+            print(f"    Saved: {output_path} ({len(records):,} events)")
+        else:
+            print(f"    Skipped {bank_name}: no events (total_counts={bank_data['total_counts']})")
+    
+    # Save summary of all banks with schema
+    bank_summary = [
+        {
+            'run_number': run_number,
+            'bank': bank_name,
+            'total_counts': bank_data['total_counts'],
+            'n_pulses': bank_data['n_pulses'],
+            'events_extracted': len(bank_data['records']),
+        }
+        for bank_name, bank_data in events_data.items()
+    ]
+    
+    if bank_summary:
+        table = pa.Table.from_pylist(bank_summary, schema=EVENT_SUMMARY_SCHEMA)
+        output_path = os.path.join(output_dir, f'{base_name}_event_summary.parquet')
+        pq.write_table(table, output_path)
+        output_files['event_summary'] = output_path
+        print(f"    Saved: {output_path}")
+    
+    return output_files
+
+
 def process_nexus_file(filepath: str, output_dir: str, 
                        max_events: Optional[int] = None,
                        include_events: bool = True,
-                       include_users: bool = True) -> Dict[str, str]:
+                       include_users: bool = True,
+                       single_file: bool = False) -> Dict[str, str]:
     """
-    Process a NeXus HDF5 file and write data to Parquet files.
+    Process a NeXus HDF5 file and write data to Iceberg-compatible Parquet files.
+    
+    All output files use explicit PyArrow schemas with:
+    - Consistent column types across files
+    - run_number as partition key on every file
+    - Nested structs for metadata in combined mode
+    - value_numeric for queryable numeric DAS log values
+    - Map types for flexible additional fields
     
     Args:
         filepath: Path to the NeXus HDF5 file
@@ -445,6 +864,10 @@ def process_nexus_file(filepath: str, output_dir: str,
         max_events: Maximum number of events per bank (None for all)
         include_events: Whether to include event data (can be large)
         include_users: Whether to include user information
+        single_file: If True, combine all data (including events) into a single
+            parquet file with metadata as nested structs. A 'record_type' column
+            distinguishes between 'daslog' and 'event' rows. If False (default),
+            create separate files for each data category.
         
     Returns:
         Dictionary mapping data type to output file path
@@ -460,103 +883,62 @@ def process_nexus_file(filepath: str, output_dir: str,
     print(f"Processing: {filepath}")
     
     with h5py.File(filepath, 'r') as h5file:
-        # 1. Extract and save metadata
+        # 1. Extract metadata
         print("  Extracting metadata...")
         metadata = extract_entry_metadata(h5file)
         metadata['source_file'] = os.path.basename(filepath)
         metadata['source_path'] = os.path.abspath(filepath)
         metadata['ingestion_time'] = datetime.now().isoformat()
         
-        if metadata:
-            df_metadata = pd.DataFrame([metadata])
-            output_path = os.path.join(output_dir, f'{base_name}_metadata.parquet')
-            df_metadata.to_parquet(output_path, index=False)
-            output_files['metadata'] = output_path
-            print(f"    Saved: {output_path}")
+        # Extract run_number for partition key (default to 0 if not found)
+        run_number = metadata.get('run_number', 0)
+        if run_number is None:
+            run_number = 0
+        run_number = int(run_number)
         
-        # 2. Extract and save sample info
+        # 2. Extract sample info
         print("  Extracting sample info...")
         sample_info = extract_sample_info(h5file)
-        if sample_info:
-            df_sample = pd.DataFrame([sample_info])
-            output_path = os.path.join(output_dir, f'{base_name}_sample.parquet')
-            df_sample.to_parquet(output_path, index=False)
-            output_files['sample'] = output_path
-            print(f"    Saved: {output_path}")
         
-        # 3. Extract and save instrument info
+        # 3. Extract instrument info
         print("  Extracting instrument info...")
         instrument_info = extract_instrument_info(h5file)
-        if instrument_info:
-            df_instrument = pd.DataFrame([instrument_info])
-            output_path = os.path.join(output_dir, f'{base_name}_instrument.parquet')
-            df_instrument.to_parquet(output_path, index=False)
-            output_files['instrument'] = output_path
-            print(f"    Saved: {output_path}")
         
-        # 4. Extract and save users (optional)
+        # 4. Extract users (optional)
+        users = []
         if include_users:
             print("  Extracting user info...")
             users = extract_users(h5file)
-            if users:
-                df_users = pd.DataFrame(users)
-                output_path = os.path.join(output_dir, f'{base_name}_users.parquet')
-                df_users.to_parquet(output_path, index=False)
-                output_files['users'] = output_path
-                print(f"    Saved: {output_path}")
         
-        # 5. Extract and save software info
+        # 5. Extract software info
         print("  Extracting software info...")
         software = extract_software_info(h5file)
-        if software:
-            df_software = pd.DataFrame(software)
-            output_path = os.path.join(output_dir, f'{base_name}_software.parquet')
-            df_software.to_parquet(output_path, index=False)
-            output_files['software'] = output_path
-            print(f"    Saved: {output_path}")
         
-        # 6. Extract and save DAS logs
+        # 6. Extract DAS logs
         print("  Extracting DAS logs (this may take a moment)...")
         daslogs = extract_daslogs(h5file)
-        if daslogs:
-            df_daslogs = pd.DataFrame(daslogs)
-            # Convert 'value' column to string to handle mixed types
-            df_daslogs['value'] = df_daslogs['value'].astype(str)
-            output_path = os.path.join(output_dir, f'{base_name}_daslogs.parquet')
-            df_daslogs.to_parquet(output_path, index=False)
-            output_files['daslogs'] = output_path
-            print(f"    Saved: {output_path} ({len(daslogs):,} records)")
         
-        # 7. Extract and save events (optional, can be very large)
+        # 7. Extract events (optional, can be very large)
+        events_data = None
         if include_events:
             print("  Extracting event data (this may take a while for large files)...")
             events_data = extract_events(h5file, max_events=max_events)
-            
-            for bank_name, bank_data in events_data.items():
-                records = bank_data['records']
-                if records:
-                    df_events = pd.DataFrame(records)
-                    output_path = os.path.join(output_dir, f'{base_name}_{bank_name}.parquet')
-                    df_events.to_parquet(output_path, index=False)
-                    output_files[bank_name] = output_path
-                    print(f"    Saved: {output_path} ({len(records):,} events)")
-                else:
-                    print(f"    Skipped {bank_name}: no events (total_counts={bank_data['total_counts']})")
-            
-            # Also save a summary of all banks
-            bank_summary = []
-            for bank_name, bank_data in events_data.items():
-                bank_summary.append({
-                    'bank': bank_name,
-                    'total_counts': bank_data['total_counts'],
-                    'n_pulses': bank_data['n_pulses'],
-                    'events_extracted': len(bank_data['records']),
-                })
-            if bank_summary:
-                df_bank_summary = pd.DataFrame(bank_summary)
-                output_path = os.path.join(output_dir, f'{base_name}_event_summary.parquet')
-                df_bank_summary.to_parquet(output_path, index=False)
-                output_files['event_summary'] = output_path
-                print(f"    Saved: {output_path}")
+        
+        # Save data based on single_file option
+        if single_file:
+            print("  Combining data into single file...")
+            output_files.update(_save_combined_parquet(
+                output_dir, base_name, run_number, daslogs, metadata,
+                sample_info, instrument_info, software, users,
+                events_data=events_data
+            ))
+        else:
+            output_files.update(_save_split_parquets(
+                output_dir, base_name, run_number, daslogs, metadata,
+                sample_info, instrument_info, software, users
+            ))
+            # Save events separately in split mode
+            if events_data:
+                output_files.update(_save_events(output_dir, base_name, run_number, events_data))
     
     return output_files

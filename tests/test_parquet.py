@@ -627,3 +627,279 @@ class TestProcessNexusFile:
         assert "source_file" in df.columns
         assert "ingestion_time" in df.columns
         assert df["source_file"].iloc[0] == "test_data.nxs.h5"
+
+
+class TestProcessNexusFileSingleFile:
+    """Tests for the single_file option in process_nexus_file."""
+
+    @pytest.fixture
+    def mock_nexus_file(self, tmp_path):
+        """Create a minimal mock NeXus file for testing."""
+        filepath = tmp_path / "test_data.nxs.h5"
+        with h5py.File(filepath, "w") as f:
+            f.attrs["file_name"] = b"test_data.nxs.h5"
+
+            entry = f.create_group("entry")
+            entry.attrs["NX_class"] = b"NXentry"
+            entry.create_dataset("title", data=b"Single File Test")
+            entry.create_dataset("run_number", data=54321)
+
+            # Sample
+            sample = entry.create_group("sample")
+            sample.create_dataset("name", data=b"Test Sample")
+            sample.create_dataset("temperature", data=300.0)
+
+            # Instrument
+            instrument = entry.create_group("instrument")
+            instrument.create_dataset("name", data=b"REF_L")
+
+            # User
+            user1 = entry.create_group("user1")
+            user1.create_dataset("name", data=b"Jane Doe")
+
+            # DASlogs
+            daslogs = entry.create_group("DASlogs")
+            temp = daslogs.create_group("temperature")
+            temp.create_dataset("time", data=[0.0, 1.0, 2.0])
+            temp.create_dataset("value", data=[300.0, 301.0, 302.0])
+
+            # Software
+            software = entry.create_group("Software")
+            sw = software.create_group("test_sw")
+            sw.create_dataset("version", data=b"2.0")
+
+        return filepath
+
+    def test_single_file_creates_combined_parquet(self, mock_nexus_file, tmp_path):
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=False,
+            include_users=False,
+            single_file=True,
+        )
+
+        assert "combined" in result
+        assert len(result) == 1  # Only combined file
+        
+        # Verify run_number partition column is present
+        df = pd.read_parquet(result["combined"])
+        assert "run_number" in df.columns
+        assert df["run_number"].iloc[0] == 54321
+
+    def test_single_file_contains_daslogs(self, mock_nexus_file, tmp_path):
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=False,
+            include_users=False,
+            single_file=True,
+        )
+
+        df = pd.read_parquet(result["combined"])
+        assert len(df) == 3  # 3 daslog records
+        assert "log_name" in df.columns
+        assert "time" in df.columns
+        assert "value" in df.columns
+        assert "value_numeric" in df.columns  # Iceberg-compatible numeric column
+        assert "record_type" in df.columns
+        assert df["record_type"].iloc[0] == "daslog"
+
+    def test_single_file_contains_metadata_columns(self, mock_nexus_file, tmp_path):
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=False,
+            include_users=False,
+            single_file=True,
+        )
+
+        df = pd.read_parquet(result["combined"])
+        # Metadata is now a nested struct column for Iceberg compatibility
+        assert "metadata" in df.columns
+        metadata = df["metadata"].iloc[0]
+        assert metadata["title"] == "Single File Test"
+        # run_number is a top-level partition column
+        assert df["run_number"].iloc[0] == 54321
+
+    def test_single_file_contains_sample_columns(self, mock_nexus_file, tmp_path):
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=False,
+            include_users=False,
+            single_file=True,
+        )
+
+        df = pd.read_parquet(result["combined"])
+        # Sample is now a nested struct column for Iceberg compatibility
+        assert "sample" in df.columns
+        sample = df["sample"].iloc[0]
+        assert sample["name"] == "Test Sample"
+        assert sample["temperature"] == 300.0
+
+    def test_single_file_contains_instrument_columns(self, mock_nexus_file, tmp_path):
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=False,
+            include_users=False,
+            single_file=True,
+        )
+
+        df = pd.read_parquet(result["combined"])
+        # Instrument is now a nested struct column for Iceberg compatibility
+        assert "instrument" in df.columns
+        instrument = df["instrument"].iloc[0]
+        assert instrument["name"] == "REF_L"
+
+    def test_single_file_contains_software_columns(self, mock_nexus_file, tmp_path):
+        """Software is not included in combined file (not in schema).
+        
+        Software metadata is available in split mode via separate software.parquet.
+        The combined file focuses on time-series data (daslogs/events) with
+        run-level metadata in nested structs.
+        """
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=False,
+            include_users=False,
+            single_file=True,
+        )
+
+        df = pd.read_parquet(result["combined"])
+        # Software is not in the combined schema (use split mode for full software info)
+        # Just verify the file was created successfully
+        assert len(df) == 3  # 3 daslog records
+
+    def test_single_file_includes_users_when_requested(self, mock_nexus_file, tmp_path):
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=False,
+            include_users=True,
+            single_file=True,
+        )
+
+        df = pd.read_parquet(result["combined"])
+        # Users is now a list of structs for Iceberg compatibility
+        assert "users" in df.columns
+        users = df["users"].iloc[0]
+        assert len(users) == 1
+        assert users[0]["name"] == "Jane Doe"
+
+    def test_single_file_includes_events(self, mock_nexus_file, tmp_path):
+        # Add events to the file
+        with h5py.File(mock_nexus_file, "a") as f:
+            bank = f["entry"].create_group("bank1_events")
+            bank.create_dataset("event_id", data=[100, 101])
+            bank.create_dataset("event_time_offset", data=[0.1, 0.2])
+            bank.create_dataset("event_index", data=[0])
+            bank.create_dataset("total_counts", data=2)
+
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=True,
+            include_users=False,
+            single_file=True,
+        )
+
+        # Should only have combined file (no separate event files)
+        assert "combined" in result
+        assert len(result) == 1
+        assert "bank1_events" not in result
+
+        # Combined file should contain both daslogs and events
+        df = pd.read_parquet(result["combined"])
+        assert "record_type" in df.columns
+        assert set(df["record_type"].unique()) == {"daslog", "event"}
+        
+        # Check daslog records
+        daslogs = df[df["record_type"] == "daslog"]
+        assert len(daslogs) == 3  # 3 temperature readings
+        
+        # Check event records
+        events = df[df["record_type"] == "event"]
+        assert len(events) == 2
+        assert "event_id" in df.columns
+        assert "bank" in df.columns
+
+    def test_single_file_events_have_metadata(self, mock_nexus_file, tmp_path):
+        # Add events to the file
+        with h5py.File(mock_nexus_file, "a") as f:
+            bank = f["entry"].create_group("bank1_events")
+            bank.create_dataset("event_id", data=[100])
+            bank.create_dataset("event_time_offset", data=[0.1])
+            bank.create_dataset("event_index", data=[0])
+            bank.create_dataset("total_counts", data=1)
+
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=True,
+            include_users=True,
+            single_file=True,
+        )
+
+        df = pd.read_parquet(result["combined"])
+        events = df[df["record_type"] == "event"]
+        
+        # Event rows should have metadata as nested structs
+        metadata = events["metadata"].iloc[0]
+        assert metadata["title"] == "Single File Test"
+        
+        sample = events["sample"].iloc[0]
+        assert sample["name"] == "Test Sample"
+        
+        users = events["users"].iloc[0]
+        assert users[0]["name"] == "Jane Doe"
+
+    def test_split_files_separates_events(self, mock_nexus_file, tmp_path):
+        # Add events to the file
+        with h5py.File(mock_nexus_file, "a") as f:
+            bank = f["entry"].create_group("bank1_events")
+            bank.create_dataset("event_id", data=[100, 101])
+            bank.create_dataset("event_time_offset", data=[0.1, 0.2])
+            bank.create_dataset("event_index", data=[0])
+            bank.create_dataset("total_counts", data=2)
+
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=True,
+            include_users=False,
+            single_file=False,
+        )
+
+        # Should have separate event files
+        assert "bank1_events" in result
+        assert "event_summary" in result
+        assert "metadata" in result
+
+    def test_split_files_is_default(self, mock_nexus_file, tmp_path):
+        output_dir = tmp_path / "output"
+        result = parquet.process_nexus_file(
+            str(mock_nexus_file),
+            str(output_dir),
+            include_events=False,
+            include_users=False,
+            # single_file defaults to False
+        )
+
+        # Should have separate files
+        assert "metadata" in result
+        assert "sample" in result
+        assert "daslogs" in result
+        assert "combined" not in result

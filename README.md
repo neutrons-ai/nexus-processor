@@ -121,6 +121,33 @@ The correlation works via:
 2. Each event has a `pulse_index` indicating which pulse it belongs to
 3. Absolute time = pulse_time + time_offset (microseconds)
 
+## Event Replay (Streaming)
+
+Stream historical events from Parquet files to downstream consumers for testing, development, or backfilling:
+
+```bash
+# Replay to stdout (pipe to other processes)
+python scripts/replay_events.py \
+    --run-id REF_L:218386 \
+    --source parquet \
+    --path ./output/REF_L_218386_events.parquet \
+    --output stdout \
+    --rate 100000
+
+# Start Arrow Flight server for high-performance streaming
+python scripts/replay_events.py \
+    --run-id REF_L:218386 \
+    --source parquet \
+    --path ./output/ \
+    --output flight \
+    --port 8815
+
+# Pipe to a reduction script
+python scripts/replay_events.py ... --output stdout | python my_reduction.py
+```
+
+See [docs/event-replay.md](docs/event-replay.md) for full documentation.
+
 ## Iceberg Table Setup
 
 Generate Iceberg table definitions:

@@ -318,84 +318,22 @@ class TestCliCombinedOptions:
         assert len(df) == 1
 
 
-class TestCliSingleFileOption:
-    """Test CLI single-file option."""
+class TestCliPartitionColumns:
+    """Test CLI output includes instrument_id and run_id."""
 
-    def test_single_file_flag_creates_combined(self, runner, mock_nexus_file, tmp_path):
-        output_dir = tmp_path / "output"
-        result = runner.invoke(
-            main,
-            [str(mock_nexus_file), "--output-dir", str(output_dir), "--single-file"],
-        )
-
-        assert result.exit_code == 0
-        combined_files = list(output_dir.glob("*_combined.parquet"))
-        assert len(combined_files) == 1
-        # Should not have separate metadata/sample files
-        metadata_files = list(output_dir.glob("*_metadata.parquet"))
-        assert len(metadata_files) == 0
-
-    def test_split_files_flag_creates_separate(self, runner, mock_nexus_file, tmp_path):
-        output_dir = tmp_path / "output"
-        result = runner.invoke(
-            main,
-            [str(mock_nexus_file), "--output-dir", str(output_dir), "--split-files"],
-        )
-
-        assert result.exit_code == 0
-        # Should have separate files
-        metadata_files = list(output_dir.glob("*_metadata.parquet"))
-        assert len(metadata_files) == 1
-        combined_files = list(output_dir.glob("*_combined.parquet"))
-        assert len(combined_files) == 0
-
-    def test_single_file_with_users(self, runner, mock_nexus_file, tmp_path):
+    def test_output_has_instrument_id(self, runner, mock_nexus_file, tmp_path):
         import pandas as pd
 
         output_dir = tmp_path / "output"
         result = runner.invoke(
-            main,
-            [
-                str(mock_nexus_file),
-                "--output-dir",
-                str(output_dir),
-                "--single-file",
-                "--include-users",
-            ],
+            main, [str(mock_nexus_file), "--output-dir", str(output_dir)]
         )
 
         assert result.exit_code == 0
-        combined_files = list(output_dir.glob("*_combined.parquet"))
-        df = pd.read_parquet(combined_files[0])
-        assert "users" in df.columns
-
-    def test_single_file_with_events(self, runner, mock_nexus_file, tmp_path):
-        import pandas as pd
-
-        output_dir = tmp_path / "output"
-        result = runner.invoke(
-            main,
-            [
-                str(mock_nexus_file),
-                "--output-dir",
-                str(output_dir),
-                "--single-file",
-                "--include-events",
-            ],
-        )
-
-        assert result.exit_code == 0
-        # Should only have combined file
-        combined_files = list(output_dir.glob("*_combined.parquet"))
-        assert len(combined_files) == 1
-        event_files = list(output_dir.glob("*_events.parquet"))
-        assert len(event_files) == 0
-
-        df = pd.read_parquet(combined_files[0])
-        assert "record_type" in df.columns
-
-    def test_single_file_help_text(self, runner):
-        result = runner.invoke(main, ["--help"])
-        assert result.exit_code == 0
-        assert "--single-file" in result.output
-        assert "--split-files" in result.output
+        metadata_files = list(output_dir.glob("*_metadata.parquet"))
+        df = pd.read_parquet(metadata_files[0])
+        assert "instrument_id" in df.columns
+        assert "run_id" in df.columns
+        # Verify run_id format
+        run_id = df["run_id"].iloc[0]
+        assert ":" in run_id

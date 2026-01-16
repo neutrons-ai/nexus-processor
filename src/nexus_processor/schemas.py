@@ -35,7 +35,9 @@ def _field(name: str, dtype: pa.DataType, description: str,
 # =============================================================================
 
 METADATA_SCHEMA = pa.schema([
+    _field("instrument_id", pa.large_string(), "Instrument identifier (e.g., REF_L)"),
     _field("run_number", pa.int64(), "Run number identifier"),
+    _field("run_id", pa.large_string(), "Unique run identifier (instrument_id:run_number)"),
     _field("title", pa.large_string(), "Experiment title"),
     _field("start_time", pa.large_string(), "Run start time (ISO format)"),
     _field("end_time", pa.large_string(), "Run end time (ISO format)"),
@@ -56,7 +58,9 @@ METADATA_SCHEMA = pa.schema([
 
 
 SAMPLE_SCHEMA = pa.schema([
+    _field("instrument_id", pa.large_string(), "Instrument identifier (partition key)"),
     _field("run_number", pa.int64(), "Run number (partition key)"),
+    _field("run_id", pa.large_string(), "Unique run identifier (instrument_id:run_number)"),
     _field("name", pa.large_string(), "Sample name"),
     _field("nature", pa.large_string(), "Sample type/nature"),
     _field("chemical_formula", pa.large_string(), "Chemical formula"),
@@ -69,7 +73,9 @@ SAMPLE_SCHEMA = pa.schema([
 
 
 INSTRUMENT_SCHEMA = pa.schema([
+    _field("instrument_id", pa.large_string(), "Instrument identifier (partition key)"),
     _field("run_number", pa.int64(), "Run number (partition key)"),
+    _field("run_id", pa.large_string(), "Unique run identifier (instrument_id:run_number)"),
     _field("name", pa.large_string(), "Instrument name (e.g., REF_L)"),
     _field("beamline", pa.large_string(), "Beamline identifier"),
     _field("instrument_xml_data", pa.large_string(), "Instrument definition XML"),
@@ -80,7 +86,9 @@ INSTRUMENT_SCHEMA = pa.schema([
 
 
 SOFTWARE_SCHEMA = pa.schema([
+    _field("instrument_id", pa.large_string(), "Instrument identifier (partition key)"),
     _field("run_number", pa.int64(), "Run number (partition key)"),
+    _field("run_id", pa.large_string(), "Unique run identifier (instrument_id:run_number)"),
     _field("component", pa.large_string(), "Software component name"),
     _field("name", pa.large_string(), "Software name"),
     _field("version", pa.large_string(), "Software version"),
@@ -91,7 +99,9 @@ SOFTWARE_SCHEMA = pa.schema([
 
 
 USERS_SCHEMA = pa.schema([
+    _field("instrument_id", pa.large_string(), "Instrument identifier (partition key)"),
     _field("run_number", pa.int64(), "Run number (partition key)"),
+    _field("run_id", pa.large_string(), "Unique run identifier (instrument_id:run_number)"),
     _field("user_id", pa.large_string(), "User group identifier (user1, user2, etc.)"),
     _field("name", pa.large_string(), "User's full name"),
     _field("facility_user_id", pa.large_string(), "Facility user ID"),
@@ -103,7 +113,9 @@ USERS_SCHEMA = pa.schema([
 
 
 DASLOGS_SCHEMA = pa.schema([
+    _field("instrument_id", pa.large_string(), "Instrument identifier (partition key)"),
     _field("run_number", pa.int64(), "Run number (partition key)"),
+    _field("run_id", pa.large_string(), "Unique run identifier (instrument_id:run_number)"),
     _field("log_name", pa.large_string(), "Name of the DAS log"),
     _field("device_name", pa.large_string(), "Device name"),
     _field("device_id", pa.large_string(), "Device identifier"),
@@ -117,7 +129,9 @@ DASLOGS_SCHEMA = pa.schema([
 
 
 EVENTS_SCHEMA = pa.schema([
+    _field("instrument_id", pa.large_string(), "Instrument identifier (partition key)"),
     _field("run_number", pa.int64(), "Run number (partition key)"),
+    _field("run_id", pa.large_string(), "Unique run identifier (instrument_id:run_number)"),
     _field("bank", pa.large_string(), "Detector bank name"),
     _field("event_idx", pa.int64(), "Event index within the bank"),
     _field("pulse_index", pa.int64(), "Pulse index (correlates to proton_charge daslog)"),
@@ -127,7 +141,9 @@ EVENTS_SCHEMA = pa.schema([
 
 
 EVENT_SUMMARY_SCHEMA = pa.schema([
+    _field("instrument_id", pa.large_string(), "Instrument identifier (partition key)"),
     _field("run_number", pa.int64(), "Run number (partition key)"),
+    _field("run_id", pa.large_string(), "Unique run identifier (instrument_id:run_number)"),
     _field("bank", pa.large_string(), "Detector bank name"),
     _field("total_counts", pa.int64(), "Total counts in the bank"),
     _field("n_pulses", pa.int64(), "Number of neutron pulses"),
@@ -136,45 +152,28 @@ EVENT_SUMMARY_SCHEMA = pa.schema([
 
 
 # =============================================================================
-# Combined Schema for Single File Mode
+# Aggregated Schema for Iceberg Tables
 # =============================================================================
 
-COMBINED_SCHEMA = pa.schema([
-    # Partition/discrimination columns
+# Schema for experiment_runs table that aggregates metadata, sample, instrument
+# into a single denormalized table. This is the primary table for querying
+# experiment information in Iceberg.
+EXPERIMENT_RUNS_SCHEMA = pa.schema([
+    # Partition columns
+    _field("instrument_id", pa.large_string(), "Instrument identifier (partition key)"),
     _field("run_number", pa.int64(), "Run number (partition key)"),
-    _field("record_type", pa.large_string(), "Record type: 'daslog' or 'event'"),
+    _field("run_id", pa.large_string(), "Unique run identifier (instrument_id:run_number)"),
     
-    # DAS log columns (NULL for events)
-    _field("log_name", pa.large_string(), "Name of the DAS log"),
-    _field("device_name", pa.large_string(), "Device name"),
-    _field("device_id", pa.large_string(), "Device identifier"),
-    _field("time", pa.float64(), "Time offset in seconds (daslogs) or microseconds (events)"),
-    _field("value", pa.large_string(), "Log value"),
-    _field("value_numeric", pa.float64(), "Numeric value if parseable"),
-    _field("average_value", pa.float64(), "Average value over the run"),
-    _field("min_value", pa.float64(), "Minimum value over the run"),
-    _field("max_value", pa.float64(), "Maximum value over the run"),
+    # Core metadata
+    _field("title", pa.large_string(), "Experiment title"),
+    _field("start_time", pa.large_string(), "Run start time (ISO format)"),
+    _field("end_time", pa.large_string(), "Run end time (ISO format)"),
+    _field("duration", pa.float64(), "Run duration in seconds"),
+    _field("proton_charge", pa.float64(), "Total proton charge"),
+    _field("total_counts", pa.int64(), "Total neutron counts"),
+    _field("experiment_identifier", pa.large_string(), "Experiment ID (e.g., IPTS number)"),
     
-    # Event columns (NULL for daslogs)
-    _field("bank", pa.large_string(), "Detector bank name"),
-    _field("event_idx", pa.int64(), "Event index within the bank"),
-    _field("pulse_index", pa.int64(), "Pulse index (correlates to proton_charge daslog)"),
-    _field("event_id", pa.int64(), "Detector pixel ID"),
-    _field("time_offset", pa.float64(), "Time offset within pulse (microseconds)"),
-    
-    # Denormalized metadata (struct type for clean organization)
-    _field("metadata", pa.struct([
-        pa.field("title", pa.large_string()),
-        pa.field("start_time", pa.large_string()),
-        pa.field("end_time", pa.large_string()),
-        pa.field("duration", pa.float64()),
-        pa.field("proton_charge", pa.float64()),
-        pa.field("total_counts", pa.int64()),
-        pa.field("experiment_identifier", pa.large_string()),
-        pa.field("definition", pa.large_string()),
-        pa.field("source_file", pa.large_string()),
-    ]), "Run metadata (nested struct)"),
-    
+    # Nested sample struct
     _field("sample", pa.struct([
         pa.field("name", pa.large_string()),
         pa.field("nature", pa.large_string()),
@@ -183,21 +182,89 @@ COMBINED_SCHEMA = pa.schema([
         pa.field("temperature", pa.float64()),
     ]), "Sample information (nested struct)"),
     
+    # Nested instrument struct
     _field("instrument", pa.struct([
         pa.field("name", pa.large_string()),
         pa.field("beamline", pa.large_string()),
     ]), "Instrument information (nested struct)"),
     
+    # Nested software list
+    _field("software", pa.list_(pa.struct([
+        pa.field("component", pa.large_string()),
+        pa.field("name", pa.large_string()),
+        pa.field("version", pa.large_string()),
+    ])), "Software components (list of structs)"),
+    
+    # Nested users list
     _field("users", pa.list_(pa.struct([
         pa.field("name", pa.large_string()),
         pa.field("role", pa.large_string()),
-    ])), "List of users"),
+        pa.field("facility_user_id", pa.large_string()),
+    ])), "Experiment users (list of structs)"),
+    
+    # Provenance
+    _field("source_file", pa.large_string(), "Original NeXus filename"),
+    _field("ingestion_time", pa.large_string(), "Conversion timestamp (ISO format)"),
 ])
 
 
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+def get_fields_without_partition(schema: pa.Schema) -> List[pa.Field]:
+    """
+    Get schema fields excluding partition columns (instrument_id, run_number).
+    
+    Useful for creating Iceberg tables where partition columns are defined
+    separately from data columns.
+    
+    Args:
+        schema: PyArrow schema
+        
+    Returns:
+        List of fields excluding instrument_id and run_number
+    """
+    partition_cols = {'instrument_id', 'run_number'}
+    return [f for f in schema if f.name not in partition_cols]
+
+
+def schema_to_iceberg_fields(schema: pa.Schema) -> str:
+    """
+    Convert PyArrow schema to Iceberg SQL field definitions.
+    
+    This helper generates the column definitions for CREATE TABLE statements.
+    
+    Args:
+        schema: PyArrow schema
+        
+    Returns:
+        SQL column definitions string
+    """
+    type_map = {
+        pa.large_string(): 'STRING',
+        pa.int64(): 'BIGINT',
+        pa.float64(): 'DOUBLE',
+    }
+    
+    lines = []
+    for field in schema:
+        if field.type in type_map:
+            sql_type = type_map[field.type]
+        elif pa.types.is_map(field.type):
+            sql_type = 'MAP<STRING, STRING>'
+        elif pa.types.is_list(field.type):
+            # Simplified - would need recursion for complex nested types
+            sql_type = 'ARRAY<STRUCT<...>>'
+        elif pa.types.is_struct(field.type):
+            sql_type = 'STRUCT<...>'
+        else:
+            sql_type = str(field.type)
+        
+        lines.append(f"  {field.name} {sql_type}")
+    
+    return ',\n'.join(lines)
+
 
 def get_schema_metadata() -> Dict[str, Dict[str, str]]:
     """
@@ -215,7 +282,7 @@ def get_schema_metadata() -> Dict[str, Dict[str, str]]:
         'daslogs': DASLOGS_SCHEMA,
         'events': EVENTS_SCHEMA,
         'event_summary': EVENT_SUMMARY_SCHEMA,
-        'combined': COMBINED_SCHEMA,
+        'experiment_runs': EXPERIMENT_RUNS_SCHEMA,
     }
     
     result = {}

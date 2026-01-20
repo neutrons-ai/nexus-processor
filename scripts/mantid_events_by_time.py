@@ -86,7 +86,8 @@ def load_nexus_file(file_path: str) -> str:
     if run.hasProperty('proton_charge'):
         pc_log = run.getProperty('proton_charge')
         times = pc_log.times
-        print(f"  Run duration: {(times[-1] - times[0]).total_seconds():.2f}s")
+        duration = (times[-1] - times[0]) / np.timedelta64(1, 's')
+        print(f"  Run duration: {duration:.2f}s")
         print(f"  Number of pulses: {len(times):,}")
     
     return ws_name
@@ -156,7 +157,7 @@ def count_by_interval(
         
         # Convert to seconds from run start
         start_time = pulse_times_abs[0]
-        pulse_times = np.array([(t - start_time).total_seconds() for t in pulse_times_abs])
+        pulse_times = (pulse_times_abs - start_time) / np.timedelta64(1, 's')
         
         # Get all events
         n_spectra = ws.getNumberHistograms()
@@ -264,7 +265,7 @@ def count_in_time_range(
         
         # Convert to seconds from run start
         start_time_abs = pulse_times_abs[0]
-        pulse_times = np.array([(t - start_time_abs).total_seconds() for t in pulse_times_abs])
+        pulse_times = (pulse_times_abs - start_time_abs) / np.timedelta64(1, 's')
         
         # Get all events
         n_spectra = ws.getNumberHistograms()

@@ -377,7 +377,8 @@ def extract_daslogs(h5file: h5py.File, entry_name: str = 'entry') -> List[Dict[s
 
 
 def extract_events(h5file: h5py.File, entry_name: str = 'entry', 
-                   max_events: Optional[int] = None) -> Dict[str, List[Dict[str, Any]]]:
+                   max_events: Optional[int] = None,
+                   pulse_times: Optional[np.ndarray] = None) -> Dict[str, List[Dict[str, Any]]]:
     """
     Extract neutron detector event data from the NeXus file.
     
@@ -385,11 +386,14 @@ def extract_events(h5file: h5py.File, entry_name: str = 'entry',
     - event_id: Detector pixel ID
     - event_time_offset: Time offset within pulse (microseconds typically)
     - event_index: Index into event arrays per pulse
+    - pulse_time: Pulse time in seconds from run start (if pulse_times provided)
+    - event_weight: Event weight (default 1.0)
     
     Args:
         h5file: Open HDF5 file handle
         entry_name: Name of the entry group
         max_events: Maximum number of events to read (None for all)
+        pulse_times: Array of pulse times (seconds from run start), indexed by pulse_index
         
     Returns:
         Dictionary with bank names as keys and lists of event records as values
@@ -444,12 +448,21 @@ def extract_events(h5file: h5py.File, entry_name: str = 'entry',
                             pulse_indices[start_idx:end_idx] = pulse_idx
                     
                     for i in range(n_events):
+                        pulse_idx = int(pulse_indices[i]) if pulse_indices is not None else None
+                        # Look up pulse_time if pulse_times array is provided
+                        pulse_time = None
+                        if pulse_times is not None and pulse_idx is not None:
+                            if 0 <= pulse_idx < len(pulse_times):
+                                pulse_time = float(pulse_times[pulse_idx])
+                        
                         record = {
                             'bank': key,
                             'event_idx': i,
-                            'pulse_index': int(pulse_indices[i]) if pulse_indices is not None else None,
+                            'pulse_index': pulse_idx,
+                            'pulse_time': pulse_time,
                             'event_id': int(event_ids[i]),
                             'time_offset': float(event_offsets[i]),
+                            'event_weight': 1.0,
                         }
                         bank_records.append(record)
                 
@@ -825,11 +838,25 @@ def process_nexus_file(filepath: str, output_dir: str,
         print("  Extracting DAS logs (this may take a moment)...")
         daslogs = extract_daslogs(h5file)
         
+        # Build pulse_times array from proton_charge log for event time correlation
+        pulse_times = None
+        if include_events:
+            # Find proton_charge times from daslogs
+            proton_charge_times = [
+                record['time'] for record in daslogs 
+                if record.get('log_name') == 'proton_charge' and record.get('time') is not None
+            ]
+            if proton_charge_times:
+                pulse_times = np.array(sorted(proton_charge_times), dtype=np.float64)
+                print(f"  Found {len(pulse_times):,} pulse times from proton_charge log")
+            else:
+                print("  Warning: No proton_charge log found, pulse_time will be null in events")
+        
         # 7. Extract events (optional, can be very large)
         events_data = None
         if include_events:
             print("  Extracting event data (this may take a while for large files)...")
-            events_data = extract_events(h5file, max_events=max_events)
+            events_data = extract_events(h5file, max_events=max_events, pulse_times=pulse_times)
         
         # Save data as separate parquet files
         output_files.update(_save_split_parquets(

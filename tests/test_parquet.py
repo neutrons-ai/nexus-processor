@@ -396,6 +396,37 @@ class TestExtractEvents:
             assert len(bank_data["records"]) == 3
             assert bank_data["records"][0]["event_id"] == 100
             assert bank_data["records"][0]["time_offset"] == pytest.approx(0.1)
+            # New fields
+            assert bank_data["records"][0]["event_weight"] == 1.0
+            assert bank_data["records"][0]["pulse_time"] is None  # No pulse_times provided
+
+    def test_extracts_event_bank_with_pulse_times(self, tmp_path):
+        """Test that pulse_time is populated when pulse_times array is provided."""
+        import numpy as np
+        filepath = tmp_path / "test.h5"
+        with h5py.File(filepath, "w") as f:
+            entry = f.create_group("entry")
+            bank1 = entry.create_group("bank1_events")
+            bank1.create_dataset("event_id", data=[100, 101, 102])
+            bank1.create_dataset("event_time_offset", data=[0.1, 0.2, 0.3])
+            bank1.create_dataset("event_index", data=[0, 2])  # pulse 0: events 0-1, pulse 1: events 2+
+            bank1.create_dataset("total_counts", data=3)
+
+        # Pulse times: pulse 0 at 10.0s, pulse 1 at 10.5s
+        pulse_times = np.array([10.0, 10.5])
+
+        with h5py.File(filepath, "r") as f:
+            result = parquet.extract_events(f, pulse_times=pulse_times)
+            bank_data = result["bank1_events"]
+            # Event 0 is in pulse 0
+            assert bank_data["records"][0]["pulse_index"] == 0
+            assert bank_data["records"][0]["pulse_time"] == pytest.approx(10.0)
+            # Event 1 is in pulse 0
+            assert bank_data["records"][1]["pulse_index"] == 0
+            assert bank_data["records"][1]["pulse_time"] == pytest.approx(10.0)
+            # Event 2 is in pulse 1
+            assert bank_data["records"][2]["pulse_index"] == 1
+            assert bank_data["records"][2]["pulse_time"] == pytest.approx(10.5)
 
     def test_respects_max_events(self, tmp_path):
         filepath = tmp_path / "test.h5"

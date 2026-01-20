@@ -135,8 +135,10 @@ EVENTS_SCHEMA = pa.schema([
     _field("bank", pa.large_string(), "Detector bank name"),
     _field("event_idx", pa.int64(), "Event index within the bank"),
     _field("pulse_index", pa.int64(), "Pulse index (correlates to proton_charge daslog)"),
+    _field("pulse_time", pa.float64(), "Pulse time in seconds from run start"),
     _field("event_id", pa.int64(), "Detector pixel ID"),
     _field("time_offset", pa.float64(), "Time offset within pulse (microseconds)"),
+    _field("event_weight", pa.float64(), "Event weight (default 1.0)"),
 ])
 
 

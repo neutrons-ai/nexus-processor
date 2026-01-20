@@ -175,7 +175,7 @@ def add_absolute_time_to_events(
     )
     
     # Calculate absolute time (time_offset is in microseconds)
-    events['absolute_time'] = events['pulse_time'] + (events['time_offset'] / 1e6)
+    #events['absolute_time'] = events['pulse_time'] + (events['time_offset'] / 1e6)
     
     # Count events with valid times
     valid = events['absolute_time'].notna()

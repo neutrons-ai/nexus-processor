@@ -9,10 +9,10 @@ This document compares the expected performance of time-slicing neutron event da
 
 The time-slicing operation requires:
 
-1. **Loading daslogs** (proton_charge) to get pulse times (~60,000 pulses for a 1-hour run at 60 Hz)
-2. **Loading events** (potentially billions of rows with `pulse_index`, `event_id`, `time_offset`)
-3. **Joining** events to pulse times on `pulse_index`
-4. **Filtering/grouping** by calculated `absolute_time = pulse_time + time_offset/1e6`
+1. **Loading events** (potentially billions of rows with `pulse_index`, `pulse_time`, `event_id`, `time_offset`)
+2. **Filtering/grouping** by `pulse_time` (directly stored in events, no join required)
+
+**Note:** As of the latest version, `pulse_time` is stored directly in each event row during the ETL process. This eliminates the need to load DAS logs or perform a join on `pulse_index`, significantly improving query performance.
 
 ---
 
@@ -29,9 +29,9 @@ The time-slicing operation requires:
 | Operation | Rating | Notes |
 |-----------|--------|-------|
 | **Partition Pruning** | ⭐⭐⭐⭐⭐ Excellent | Iceberg metadata allows skipping entire partitions; querying `run_id = 'REF_L:218386'` only reads that run's data |
-| **Column Pruning** | ⭐⭐⭐⭐⭐ Excellent | Parquet columnar format means `pulse_index`, `time_offset` read without touching `event_id` |
-| **Predicate Pushdown** | ⭐⭐⭐⭐ Good | Some filtering can be pushed to Parquet row groups |
-| **Join Performance** | ⭐⭐⭐⭐ Good | Broadcast join works well (pulse_times ~60K rows fits in memory) |
+| **Column Pruning** | ⭐⭐⭐⭐⭐ Excellent | Parquet columnar format means `pulse_time`, `time_offset` read without touching `event_id` |
+| **Predicate Pushdown** | ⭐⭐⭐⭐⭐ Excellent | Filter on `pulse_time` pushes down to Parquet row groups |
+| **Join Performance** | N/A | Join eliminated—`pulse_time` stored directly in events |
 | **Aggregation** | ⭐⭐⭐⭐⭐ Excellent | Native Spark GROUP BY is highly optimized |
 | **Scalability** | ⭐⭐⭐⭐⭐ Excellent | Horizontal scaling to cluster, parallelized across workers |
 | **Multi-Run Analysis** | ⭐⭐⭐⭐⭐ Excellent | Single query can span thousands of runs |
@@ -40,11 +40,12 @@ The time-slicing operation requires:
 
 ```
 1 billion events, single run:
-├── Read daslogs (proton_charge): ~1-2 seconds
 ├── Read events (only needed columns): ~30-60 seconds (depends on cluster size)
-├── Join + aggregate: ~10-20 seconds
-└── Total: ~1-2 minutes on single node, <30 seconds on 4-node cluster
+├── Filter + aggregate on pulse_time: ~10-20 seconds
+└── Total: ~40-80 seconds on single node, <20 seconds on 4-node cluster
 ```
+
+**Note:** Since `pulse_time` is stored directly in events, no separate DAS log read or join is needed.
 
 ---
 
@@ -88,7 +89,7 @@ The NeXus event data is stored as **parallel 1D arrays** (`event_id`, `event_tim
 
 | Factor | Parquet/Iceberg | Tiled + HDF5 | Winner |
 |--------|-----------------|--------------|--------|
-| **Time-slice query (1B events)** | ~1-2 min | ~10-18 min | **Parquet** (5-10x faster) |
+| **Time-slice query (1B events)** | ~40-80 sec | ~10-18 min | **Parquet** (10-15x faster) |
 | **Multi-run aggregation** | Single SQL query | Loop over files | **Parquet** (orders of magnitude) |
 | **Storage efficiency** | ~40-60% of HDF5 size | Original size | **Parquet** (columnar compression) |
 | **Schema evolution** | Iceberg handles it | Fixed by NeXus schema | **Parquet** |
@@ -104,13 +105,15 @@ The NeXus event data is stored as **parallel 1D arrays** (`event_id`, `event_tim
 
 ### Why Parquet/Iceberg Wins for Time-Slicing
 
-1. **Columnar Storage**: Reading only `pulse_index` and `time_offset` from 1B events means reading ~16 GB instead of 40+ GB (skipping `event_id`, etc.)
+1. **Columnar Storage**: Reading only `pulse_time` and `time_offset` from 1B events means reading ~16 GB instead of 40+ GB (skipping `event_id`, etc.)
 
-2. **Predicate Pushdown**: Parquet row groups (~128 MB each) have min/max statistics. If you filter `time_offset < 1000000`, entire row groups can be skipped.
+2. **Embedded Pulse Time**: `pulse_time` is stored directly in events during ETL, eliminating the need to load DAS logs and perform joins at query time
 
-3. **Distributed Processing**: Spark parallelizes across cores/nodes. A 4-worker cluster processes 4x faster.
+3. **Predicate Pushdown**: Parquet row groups (~128 MB each) have min/max statistics. Filtering on `pulse_time < 60.0` allows entire row groups to be skipped.
 
-4. **Native SQL Aggregation**: `GROUP BY interval` with `COUNT(*)` is a single pass—no client-side loop needed.
+4. **Distributed Processing**: Spark parallelizes across cores/nodes. A 4-worker cluster processes 4x faster.
+
+5. **Native SQL Aggregation**: `GROUP BY interval` with `COUNT(*)` is a single pass—no client-side loop needed.
 
 ### When Tiled + HDF5 is Better
 
@@ -137,7 +140,7 @@ The NeXus event data is stored as **parallel 1D arrays** (`event_id`, `event_tim
 
 ### Summary
 
-The lakehouse approach (nexus-processor → Parquet → Iceberg) is the right architecture for repeated, large-scale time-slicing queries. The one-time ETL cost pays off with **5-10x faster queries**.
+The lakehouse approach (nexus-processor → Parquet → Iceberg) is the right architecture for repeated, large-scale time-slicing queries. The one-time ETL cost (which now includes embedding `pulse_time` directly in events) pays off with **10-15x faster queries** by eliminating joins at query time.
 
 ---
 

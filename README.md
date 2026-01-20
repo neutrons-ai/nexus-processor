@@ -93,7 +93,15 @@ Neutron event data can be extremely large (billions of events). Design decisions
 1. **Separate files per detector bank**: Enables parallel processing
 2. **Chunking support**: `--max-events-per-file` splits large banks (e.g., 10M events ≈ 200MB)
 3. **Pulse correlation**: Each event includes `pulse_index` for time reconstruction
-4. **Time extraction**: Events can be correlated to wall-clock time via `proton_charge` DAS log
+4. **Embedded pulse time**: Events include `pulse_time` (seconds from run start) for efficient time-based queries without joining DAS logs
+5. **Event weights**: Events include `event_weight` (default 1.0) for weighted histogramming
+
+Event columns:
+- `pulse_index`: Index of the accelerator pulse this event belongs to
+- `pulse_time`: Time of the pulse in seconds from run start (enables direct time filtering)
+- `event_id`: Detector pixel identifier  
+- `time_offset`: Time offset within the pulse (microseconds)
+- `event_weight`: Weight for this event (default 1.0)
 
 ### Iceberg Compatibility
 
@@ -106,7 +114,7 @@ Schemas are designed for Apache Iceberg table format:
 
 ## Event Time Extraction
 
-Neutron events are recorded relative to accelerator pulses. To extract events by wall-clock time:
+Neutron events are recorded relative to accelerator pulses. Each event now includes `pulse_time` directly, enabling efficient time-based filtering without joining with DAS logs.
 
 ```bash
 # Extract events in 60-second intervals
@@ -114,12 +122,17 @@ python scripts/extract_events_by_time.py ./output --run-id REF_L:218386 --interv
 
 # Extract events between 30 and 90 seconds
 python scripts/extract_events_by_time.py ./output --run-id REF_L:218386 --start 30 --end 90
+
+# Include error/unmapped events (excluded by default)
+python scripts/extract_events_by_time.py ./output --run-id REF_L:218386 --interval 60 --include-error-events
 ```
 
-The correlation works via:
-1. `proton_charge` DAS log records wall-clock time of each neutron pulse
-2. Each event has a `pulse_index` indicating which pulse it belongs to
-3. Absolute time = pulse_time + time_offset (microseconds)
+The time fields work as follows:
+- `pulse_time`: Time of the pulse in seconds from run start (stored directly in events)
+- `time_offset`: Time within the pulse (microseconds)
+- Absolute time = `pulse_time` + `time_offset` / 1,000,000
+
+**Note**: Error events (`bank_error_events`) and unmapped events (`bank_unmapped_events`) are excluded by default. Use `--include-error-events` to include them.
 
 ## Event Replay (Streaming)
 

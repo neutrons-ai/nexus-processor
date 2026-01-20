@@ -204,8 +204,10 @@ Example message:
     "bank": "bank1",
     "event_idx": 0,
     "pulse_index": 42,
+    "pulse_time": 1.234567,
     "event_id": 12345,
-    "time_offset": 1234.567
+    "time_offset": 1234.567,
+    "event_weight": 1.0
 }
 ```
 

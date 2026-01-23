@@ -21,19 +21,19 @@ pip install -e .
 
 ```bash
 # Basic conversion (excludes events and users by default)
-nexus-to-parquet input.nxs.h5 -o ./output
+nexus-processor input.nxs.h5 -o ./output
 
 # Include neutron events
-nexus-to-parquet input.nxs.h5 -o ./output --include-events
+nexus-processor input.nxs.h5 -o ./output --include-events
 
 # Include events with limit (for testing)
-nexus-to-parquet input.nxs.h5 -o ./output --include-events --max-events 100000
+nexus-processor input.nxs.h5 -o ./output --include-events --max-events 100000
 
 # Include user information
-nexus-to-parquet input.nxs.h5 -o ./output --include-users
+nexus-processor input.nxs.h5 -o ./output --include-users
 
 # Chunk large event files for Iceberg compatibility
-nexus-to-parquet input.nxs.h5 -o ./output --include-events --max-events-per-file 10000000
+nexus-processor input.nxs.h5 -o ./output --include-events --max-events-per-file 10000000
 ```
 
 ## Output Files

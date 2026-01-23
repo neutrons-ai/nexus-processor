@@ -64,6 +64,29 @@ from nexus_processor.schemas import (
 )
 
 
+
+def _write_table_with_metadata(table: pa.Table, output_path: str, iceberg_table: str) -> None:
+    """
+    Write a PyArrow table with Iceberg routing metadata.
+    
+    Embeds 'iceberg_table' in the parquet file's schema metadata so that
+    downstream ingestion tools can automatically route files to the correct
+    Iceberg table without hardcoded filename patterns.
+    
+    Args:
+        table: PyArrow table to write
+        output_path: Path to write the parquet file
+        iceberg_table: Target Iceberg table name (e.g., 'daslogs', 'events')
+    """
+    existing_metadata = table.schema.metadata or {}
+    new_metadata = {
+        **existing_metadata,
+        b'iceberg_table': iceberg_table.encode('utf-8'),
+    }
+    table = table.replace_schema_metadata(new_metadata)
+    pq.write_table(table, output_path)
+
+
 def safe_decode(value: Any) -> Any:
     """
     Safely decode bytes to string and handle numpy arrays.
@@ -571,7 +594,7 @@ def _save_split_parquets(
         }
         table = pa.Table.from_pylist([record], schema=METADATA_SCHEMA)
         output_path = os.path.join(output_dir, f'{base_name}_metadata.parquet')
-        pq.write_table(table, output_path)
+        _write_table_with_metadata(table, output_path, 'experiment_runs')
         output_files['metadata'] = output_path
         print(f"    Saved: {output_path}")
     
@@ -589,7 +612,7 @@ def _save_split_parquets(
         }
         table = pa.Table.from_pylist([record], schema=SAMPLE_SCHEMA)
         output_path = os.path.join(output_dir, f'{base_name}_sample.parquet')
-        pq.write_table(table, output_path)
+        _write_table_with_metadata(table, output_path, 'sample')
         output_files['sample'] = output_path
         print(f"    Saved: {output_path}")
     
@@ -605,7 +628,7 @@ def _save_split_parquets(
         }
         table = pa.Table.from_pylist([record], schema=INSTRUMENT_SCHEMA)
         output_path = os.path.join(output_dir, f'{base_name}_instrument.parquet')
-        pq.write_table(table, output_path)
+        _write_table_with_metadata(table, output_path, 'instrument')
         output_files['instrument'] = output_path
         print(f"    Saved: {output_path}")
     
@@ -624,7 +647,7 @@ def _save_split_parquets(
             })
         table = pa.Table.from_pylist(records, schema=USERS_SCHEMA)
         output_path = os.path.join(output_dir, f'{base_name}_users.parquet')
-        pq.write_table(table, output_path)
+        _write_table_with_metadata(table, output_path, 'users')
         output_files['users'] = output_path
         print(f"    Saved: {output_path}")
     
@@ -642,7 +665,7 @@ def _save_split_parquets(
             })
         table = pa.Table.from_pylist(records, schema=SOFTWARE_SCHEMA)
         output_path = os.path.join(output_dir, f'{base_name}_software.parquet')
-        pq.write_table(table, output_path)
+        _write_table_with_metadata(table, output_path, 'software')
         output_files['software'] = output_path
         print(f"    Saved: {output_path}")
     
@@ -665,7 +688,7 @@ def _save_split_parquets(
             })
         table = pa.Table.from_pylist(records, schema=DASLOGS_SCHEMA)
         output_path = os.path.join(output_dir, f'{base_name}_daslogs.parquet')
-        pq.write_table(table, output_path)
+        _write_table_with_metadata(table, output_path, 'daslogs')
         output_files['daslogs'] = output_path
         print(f"    Saved: {output_path} ({len(daslogs):,} records)")
     
@@ -722,13 +745,13 @@ def _save_events(
                     table = pa.Table.from_pylist(chunk, schema=EVENTS_SCHEMA)
                     part_name = f"{bank_name}_part{i+1:03d}"
                     output_path = os.path.join(output_dir, f'{base_name}_{part_name}.parquet')
-                    pq.write_table(table, output_path)
+                    _write_table_with_metadata(table, output_path, 'events')
                     output_files[part_name] = output_path
                     print(f"      Saved: {output_path} ({len(chunk):,} events)")
             else:
                 table = pa.Table.from_pylist(records_with_ids, schema=EVENTS_SCHEMA)
                 output_path = os.path.join(output_dir, f'{base_name}_{bank_name}.parquet')
-                pq.write_table(table, output_path)
+                _write_table_with_metadata(table, output_path, 'events')
                 output_files[bank_name] = output_path
                 print(f"    Saved: {output_path} ({len(records):,} events)")
         else:
@@ -751,7 +774,7 @@ def _save_events(
     if bank_summary:
         table = pa.Table.from_pylist(bank_summary, schema=EVENT_SUMMARY_SCHEMA)
         output_path = os.path.join(output_dir, f'{base_name}_event_summary.parquet')
-        pq.write_table(table, output_path)
+        _write_table_with_metadata(table, output_path, 'event_summary')
         output_files['event_summary'] = output_path
         print(f"    Saved: {output_path}")
     

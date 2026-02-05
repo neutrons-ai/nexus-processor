@@ -63,6 +63,17 @@ from nexus_processor.schemas import (
     extract_known_fields,
 )
 
+from nexus_processor.mantid import (
+    detect_nexus_format,
+    get_mantid_workspace_name,
+    get_mantid_instrument_id,
+    extract_mantid_metadata,
+    extract_mantid_instrument_info,
+    extract_mantid_sample_info,
+    extract_mantid_logs,
+    extract_mantid_events,
+)
+
 
 
 def _write_table_with_metadata(table: pa.Table, output_path: str, iceberg_table: str) -> None:
@@ -85,6 +96,41 @@ def _write_table_with_metadata(table: pa.Table, output_path: str, iceberg_table:
     }
     table = table.replace_schema_metadata(new_metadata)
     pq.write_table(table, output_path)
+
+
+class _ChunkedParquetWriter:
+    """
+    Context manager for writing parquet files in chunks.
+    
+    Uses pq.ParquetWriter to append row groups instead of overwriting.
+    Adds Iceberg routing metadata to the schema.
+    """
+    def __init__(self, output_path: str, schema: pa.Schema, iceberg_table: str):
+        self.output_path = output_path
+        # Add Iceberg metadata to schema
+        existing_metadata = schema.metadata or {}
+        new_metadata = {
+            **existing_metadata,
+            b'iceberg_table': iceberg_table.encode('utf-8'),
+        }
+        self.schema = schema.with_metadata(new_metadata)
+        self.writer = None
+    
+    def __enter__(self):
+        self.writer = pq.ParquetWriter(self.output_path, self.schema)
+        return self
+    
+    def write_chunk(self, table: pa.Table) -> None:
+        """Write a chunk (row group) to the parquet file."""
+        if self.writer is None:
+            raise RuntimeError("Writer not initialized. Use as context manager.")
+        # Ensure table matches the schema with metadata
+        table = table.cast(self.schema)
+        self.writer.write_table(table)
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.writer is not None:
+            self.writer.close()
 
 
 def safe_decode(value: Any) -> Any:
@@ -606,8 +652,8 @@ def _save_split_parquets(
             'name': normalize_to_string(sample_info.get('name')),
             'nature': normalize_to_string(sample_info.get('nature')),
             'chemical_formula': normalize_to_string(sample_info.get('chemical_formula')),
-            'mass': sample_info.get('mass'),
-            'temperature': sample_info.get('temperature'),
+            'mass': try_parse_numeric(sample_info.get('mass')),
+            'temperature': try_parse_numeric(sample_info.get('temperature')),
             'additional_fields': extract_known_fields(sample_info, SAMPLE_KNOWN),
         }
         table = pa.Table.from_pylist([record], schema=SAMPLE_SCHEMA)
@@ -670,23 +716,73 @@ def _save_split_parquets(
         print(f"    Saved: {output_path}")
     
     if daslogs:
-        records = []
-        for log in daslogs:
-            records.append({
-                'instrument_id': instrument_id,
-                'run_number': run_number,
-                'run_id': run_id,
-                'log_name': normalize_to_string(log.get('log_name')),
-                'device_name': normalize_to_string(log.get('device_name')),
-                'device_id': normalize_to_string(log.get('device_id')),
-                'time': log.get('time'),
-                'value': normalize_to_string(log.get('value')),
-                'value_numeric': try_parse_numeric(log.get('value')),
-                'average_value': log.get('average_value'),
-                'min_value': log.get('min_value'),
-                'max_value': log.get('max_value'),
+        import time
+        start_time = time.time()
+        n_records = len(daslogs)
+        
+        # For large log datasets, use vectorized approach
+        if n_records > 100_000:
+            print(f"    Building {n_records:,} DASlog records (vectorized)...")
+            
+            # Pre-allocate lists
+            log_names = []
+            device_names = []
+            device_ids = []
+            times = []
+            values = []
+            value_numerics = []
+            average_values = []
+            min_values = []
+            max_values = []
+            
+            for log in daslogs:
+                log_names.append(normalize_to_string(log.get('log_name')))
+                device_names.append(normalize_to_string(log.get('device_name')))
+                device_ids.append(normalize_to_string(log.get('device_id')))
+                times.append(log.get('time'))
+                val = log.get('value')
+                values.append(normalize_to_string(val))
+                value_numerics.append(try_parse_numeric(val))
+                average_values.append(log.get('average_value'))
+                min_values.append(log.get('min_value'))
+                max_values.append(log.get('max_value'))
+            
+            # Build table directly from arrays
+            table = pa.table({
+                'instrument_id': pa.array([instrument_id] * n_records, type=pa.large_string()),
+                'run_number': pa.array([run_number] * n_records, type=pa.int64()),
+                'run_id': pa.array([run_id] * n_records, type=pa.large_string()),
+                'log_name': pa.array(log_names, type=pa.large_string()),
+                'device_name': pa.array(device_names, type=pa.large_string()),
+                'device_id': pa.array(device_ids, type=pa.large_string()),
+                'time': pa.array(times, type=pa.float64()),
+                'value': pa.array(values, type=pa.large_string()),
+                'value_numeric': pa.array(value_numerics, type=pa.float64()),
+                'average_value': pa.array(average_values, type=pa.float64()),
+                'min_value': pa.array(min_values, type=pa.float64()),
+                'max_value': pa.array(max_values, type=pa.float64()),
             })
-        table = pa.Table.from_pylist(records, schema=DASLOGS_SCHEMA)
+            elapsed = time.time() - start_time
+            print(f"    DASlog table built in {elapsed:.1f}s ({n_records/elapsed:,.0f} records/sec)")
+        else:
+            records = []
+            for log in daslogs:
+                records.append({
+                    'instrument_id': instrument_id,
+                    'run_number': run_number,
+                    'run_id': run_id,
+                    'log_name': normalize_to_string(log.get('log_name')),
+                    'device_name': normalize_to_string(log.get('device_name')),
+                    'device_id': normalize_to_string(log.get('device_id')),
+                    'time': log.get('time'),
+                    'value': normalize_to_string(log.get('value')),
+                    'value_numeric': try_parse_numeric(log.get('value')),
+                    'average_value': log.get('average_value'),
+                    'min_value': log.get('min_value'),
+                    'max_value': log.get('max_value'),
+                })
+            table = pa.Table.from_pylist(records, schema=DASLOGS_SCHEMA)
+        
         output_path = os.path.join(output_dir, f'{base_name}_daslogs.parquet')
         _write_table_with_metadata(table, output_path, 'daslogs')
         output_files['daslogs'] = output_path
@@ -781,13 +877,288 @@ def _save_events(
     return output_files
 
 
+def _save_mantid_events_chunked(
+    output_dir: str,
+    base_name: str,
+    instrument_id: str,
+    run_number: int,
+    h5file: h5py.File,
+    workspace_name: str,
+    max_events: Optional[int] = None,
+    max_events_per_file: Optional[int] = None,
+) -> Dict[str, str]:
+    """
+    Save Mantid event data to parquet files with chunked processing.
+    
+    This function uses VECTORIZED operations to process events efficiently.
+    Events are processed in chunks to handle large files (100M+ events)
+    without loading everything into memory.
+    
+    Args:
+        output_dir: Directory to write parquet files
+        base_name: Base name for output files
+        instrument_id: Instrument identifier
+        run_number: Run number for partition key
+        h5file: Open HDF5 file handle
+        workspace_name: Name of the mantid workspace group
+        max_events: Maximum number of events to read (None for all)
+        max_events_per_file: Maximum events per output file
+        
+    Returns:
+        Dictionary mapping output names to file paths
+    """
+    import time
+    output_files = {}
+    run_id = make_run_id(instrument_id, run_number)
+    
+    event_path = f'{workspace_name}/event_workspace'
+    if event_path not in h5file:
+        print("    No event_workspace found")
+        return output_files
+    
+    event_ws = h5file[event_path]
+    
+    if 'tof' not in event_ws or 'indices' not in event_ws:
+        print("    Missing tof or indices datasets")
+        return output_files
+    
+    tof_ds = event_ws['tof']
+    indices_ds = event_ws['indices']
+    
+    n_events_total = tof_ds.shape[0]
+    n_spectra = indices_ds.shape[0] - 1
+    
+    print(f"    Found {n_events_total:,} events across {n_spectra:,} spectra")
+    
+    # Limit events if requested
+    n_events = n_events_total
+    if max_events and n_events > max_events:
+        n_events = max_events
+        print(f"    Limiting to {n_events:,} events")
+    
+    # Read indices array (needed for event-to-spectrum mapping)
+    indices = indices_ds[:]
+    
+    # Determine chunk size for writing
+    if max_events_per_file:
+        write_chunk_size = max_events_per_file
+    else:
+        write_chunk_size = n_events  # Single file
+    
+    # Check for weights
+    has_weights = 'weight' in event_ws
+    
+    # Pre-compute constant arrays for the schema
+    # These will be broadcast/repeated for each chunk
+    
+    file_number = 0
+    total_written = 0
+    start_time = time.time()
+    
+    # Process in chunks - use larger chunks for better throughput
+    read_chunk_size = min(write_chunk_size, 10_000_000)  # 10M events per read
+    
+    # Determine output path once before the loop
+    if max_events_per_file and n_events > max_events_per_file:
+        # Will create multiple files
+        output_path = None  # Set per chunk in loop
+    else:
+        # Single output file for all chunks
+        output_path = os.path.join(output_dir, f'{base_name}_event_workspace.parquet')
+        output_files['event_workspace'] = output_path
+    
+    # Open writer for single-file mode (will append chunks)
+    writer = None
+    if output_path is not None:
+        writer = _ChunkedParquetWriter(output_path, EVENTS_SCHEMA, 'events')
+        writer.__enter__()
+    
+    try:
+        for start_idx in range(0, n_events, read_chunk_size):
+            end_idx = min(start_idx + read_chunk_size, n_events)
+            chunk_size = end_idx - start_idx
+            
+            # Read TOF chunk directly as numpy array
+            tof_chunk = tof_ds[start_idx:end_idx]
+            
+            # Read weights if available
+            if has_weights:
+                weight_chunk = event_ws['weight'][start_idx:end_idx]
+            else:
+                weight_chunk = np.ones(chunk_size, dtype=np.float32)
+            
+            # VECTORIZED: Map events to spectrum IDs using searchsorted
+            event_indices = np.arange(start_idx, end_idx, dtype=np.int64)
+            event_ids = np.searchsorted(indices, event_indices, side='right') - 1
+            
+            # VECTORIZED: Build PyArrow arrays directly (no Python loop!)
+            table = pa.table({
+                'instrument_id': pa.array([instrument_id] * chunk_size, type=pa.large_string()),
+                'run_number': pa.array(np.full(chunk_size, run_number, dtype=np.int64)),
+                'run_id': pa.array([run_id] * chunk_size, type=pa.large_string()),
+                'bank': pa.array(['event_workspace'] * chunk_size, type=pa.large_string()),
+                'event_idx': pa.array(event_indices),
+                'pulse_index': pa.array([None] * chunk_size, type=pa.int64()),
+                'pulse_time': pa.array([None] * chunk_size, type=pa.float64()),
+                'event_id': pa.array(event_ids),
+                'time_offset': pa.array(tof_chunk.astype(np.float64)),
+                'event_weight': pa.array(weight_chunk.astype(np.float64)),
+            })
+            
+            # Write chunk to file
+            if max_events_per_file and n_events > max_events_per_file:
+                # Multi-file mode: create new file for each chunk
+                file_number += 1
+                part_name = f"event_workspace_part{file_number:03d}"
+                chunk_output_path = os.path.join(output_dir, f'{base_name}_{part_name}.parquet')
+                output_files[part_name] = chunk_output_path
+                _write_table_with_metadata(table, chunk_output_path, 'events')
+            else:
+                # Single-file mode: append chunk to writer
+                writer.write_chunk(table)
+            
+            total_written += chunk_size
+            
+            # Progress reporting with throughput
+            elapsed = time.time() - start_time
+            rate = total_written / elapsed / 1_000_000 if elapsed > 0 else 0
+            print(f"      Written {total_written:,} / {n_events:,} events "
+                  f"({100*total_written/n_events:.1f}%) - {rate:.1f}M events/sec")
+    finally:
+        # Close writer if opened
+        if writer is not None:
+            writer.__exit__(None, None, None)
+    
+    # Save event summary
+    summary = [{
+        'instrument_id': instrument_id,
+        'run_number': run_number,
+        'run_id': run_id,
+        'bank': 'event_workspace',
+        'total_counts': n_events_total,
+        'n_pulses': 0,  # No pulse info in .lite files
+        'events_extracted': n_events,
+    }]
+    
+    table = pa.Table.from_pylist(summary, schema=EVENT_SUMMARY_SCHEMA)
+    output_path = os.path.join(output_dir, f'{base_name}_event_summary.parquet')
+    _write_table_with_metadata(table, output_path, 'event_summary')
+    output_files['event_summary'] = output_path
+    print(f"    Saved: {output_path}")
+    
+    total_time = time.time() - start_time
+    print(f"    Total event processing time: {total_time:.1f}s "
+          f"({n_events/total_time/1_000_000:.1f}M events/sec)")
+    
+    return output_files
+    output_files['event_summary'] = output_path
+    print(f"    Saved: {output_path}")
+    
+    return output_files
+
+
+def process_mantid_file(filepath: str, output_dir: str,
+                        max_events: Optional[int] = None,
+                        max_events_per_file: Optional[int] = None,
+                        include_events: bool = True) -> Dict[str, str]:
+    """
+    Process a Mantid-format NeXus file and write data to Parquet files.
+    
+    Mantid files have a different structure than standard NeXus:
+    - Root: /mantid_workspace_1/ instead of /entry/
+    - Events: /event_workspace/ with tof, indices, weight
+    - Logs: /logs/ instead of /DASlogs/
+    - No pulse timing in .lite files
+    
+    Args:
+        filepath: Path to the Mantid NeXus file
+        output_dir: Directory to write Parquet files
+        max_events: Maximum number of events to read (None for all)
+        max_events_per_file: Maximum events per output file for chunking
+        include_events: Whether to include event data
+        
+    Returns:
+        Dictionary mapping data type to output file path
+    """
+    output_files = {}
+    
+    os.makedirs(output_dir, exist_ok=True)
+    base_name = Path(filepath).stem.replace('.nxs', '').replace('.h5', '').replace('.lite', '')
+    
+    print(f"Processing (Mantid format): {filepath}")
+    
+    with h5py.File(filepath, 'r') as h5file:
+        # Find the workspace
+        workspace_name = get_mantid_workspace_name(h5file)
+        if not workspace_name:
+            raise ValueError(f"No mantid_workspace found in {filepath}")
+        
+        print(f"  Found workspace: {workspace_name}")
+        
+        # Get instrument ID
+        instrument_id = get_mantid_instrument_id(h5file, workspace_name)
+        print(f"  Instrument: {instrument_id}")
+        
+        # Extract metadata
+        print("  Extracting metadata...")
+        metadata = extract_mantid_metadata(h5file, workspace_name)
+        metadata['source_file'] = os.path.basename(filepath)
+        metadata['source_path'] = os.path.abspath(filepath)
+        metadata['ingestion_time'] = datetime.now().isoformat()
+        
+        # Get run_number
+        run_number = metadata.get('run_number', 0)
+        if run_number is None:
+            run_number = 0
+        run_number = int(run_number)
+        
+        run_id = make_run_id(instrument_id, run_number)
+        print(f"  Run identifier: {run_id}")
+        
+        # Extract sample info
+        print("  Extracting sample info...")
+        sample_info = extract_mantid_sample_info(h5file, workspace_name)
+        
+        # Extract instrument info
+        print("  Extracting instrument info...")
+        instrument_info = extract_mantid_instrument_info(h5file, workspace_name)
+        
+        # Extract logs (DASlog equivalent)
+        print("  Extracting logs...")
+        daslogs = extract_mantid_logs(h5file, workspace_name)
+        print(f"    Found {len(daslogs):,} log records")
+        
+        # Save metadata, sample, instrument, and daslogs
+        output_files.update(_save_split_parquets(
+            output_dir, base_name, instrument_id, run_number, daslogs, metadata,
+            sample_info, instrument_info, software=[], users=[]
+        ))
+        
+        # Extract and save events
+        if include_events:
+            print("  Extracting events (chunked processing for large files)...")
+            output_files.update(_save_mantid_events_chunked(
+                output_dir, base_name, instrument_id, run_number,
+                h5file, workspace_name,
+                max_events=max_events,
+                max_events_per_file=max_events_per_file,
+            ))
+    
+    return output_files
+
+
 def process_nexus_file(filepath: str, output_dir: str, 
                        max_events: Optional[int] = None,
                        max_events_per_file: Optional[int] = None,
                        include_events: bool = True,
-                       include_users: bool = True) -> Dict[str, str]:
+                       include_users: bool = True,
+                       force_format: Optional[str] = None) -> Dict[str, str]:
     """
     Process a NeXus HDF5 file and write data to Iceberg-compatible Parquet files.
+    
+    Automatically detects the file format:
+    - Standard NeXus: /entry/ structure with bank*_events
+    - Mantid: /mantid_workspace_*/ structure with event_workspace
     
     All output files use explicit PyArrow schemas with:
     - Consistent column types across files
@@ -803,10 +1174,30 @@ def process_nexus_file(filepath: str, output_dir: str,
         max_events_per_file: Maximum events per output file for chunking (None for no limit)
         include_events: Whether to include event data (can be large)
         include_users: Whether to include user information
+        force_format: Force format detection ('standard', 'mantid', or None for auto)
         
     Returns:
         Dictionary mapping data type to output file path
     """
+    # Detect file format
+    with h5py.File(filepath, 'r') as h5file:
+        if force_format:
+            file_format = force_format
+        else:
+            file_format = detect_nexus_format(h5file)
+    
+    print(f"Detected format: {file_format}")
+    
+    # Route to appropriate processor
+    if file_format == 'mantid':
+        return process_mantid_file(
+            filepath, output_dir,
+            max_events=max_events,
+            max_events_per_file=max_events_per_file,
+            include_events=include_events,
+        )
+    
+    # Standard NeXus processing (existing code)
     output_files = {}
     
     # Create output directory

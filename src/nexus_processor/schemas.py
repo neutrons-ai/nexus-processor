@@ -380,3 +380,45 @@ def extract_known_fields(data: Dict[str, Any], known_fields: List[str]) -> Dict[
         if key not in known_fields and not key.startswith(('file_attr_', 'entry_attr_')):
             result[key] = normalize_to_string(value)
     return result
+
+
+# =============================================================================
+# Mantid Workspace Format Constants
+# =============================================================================
+
+# Expected metadata fields in Mantid-processed NeXus files
+MANTID_METADATA_FIELDS = [
+    'title',           # /mantid_workspace_1/title
+    'workspace_name',  # /mantid_workspace_1/workspace_name
+    'definition',      # /mantid_workspace_1/definition
+]
+
+# Log names to prioritize for metadata extraction
+MANTID_PRIORITY_LOGS = [
+    'run_number',
+    'run_start',
+    'run_title',
+    'duration',
+    'proton_charge',
+    'gd_prtn_chrg',    # Alternative proton charge log name
+    'start_time',
+    'end_time',
+    'experiment_identifier',
+    'IPTS',
+]
+
+# Instrument-related logs to extract as instrument info
+MANTID_INSTRUMENT_LOGS = [
+    'beamline',
+    'facility',
+    'instrument',
+]
+
+# Sample-related log prefixes (SNAP uses BL3:CS:ITEMS:*)
+MANTID_SAMPLE_LOG_PREFIXES = [
+    'BL3:CS:ITEMS:',   # SNAP sample info
+    'SampleDescription',
+    'SampleFormula',
+    'SampleMass',
+    'SampleTemp',
+]

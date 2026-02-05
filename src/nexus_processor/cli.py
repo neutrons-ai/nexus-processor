@@ -47,12 +47,24 @@ from nexus_processor.parquet import process_nexus_file
     help='Maximum events per output file for chunking (default: no limit). '
          'Recommended: 10000000 (~200MB files)',
 )
+@click.option(
+    '--format', '-f',
+    type=click.Choice(['auto', 'standard', 'mantid'], case_sensitive=False),
+    default='auto',
+    help='Force file format (auto: detect automatically, standard: /entry/ structure, '
+         'mantid: /mantid_workspace_*/ structure)',
+)
 def main(input_file: str, output_dir: str, include_events: bool, 
-         include_users: bool, max_events: int, max_events_per_file: int) -> None:
+         include_users: bool, max_events: int, max_events_per_file: int,
+         format: str) -> None:
     """
     Convert NeXus HDF5 files to Parquet format.
 
     INPUT_FILE is the path to the NeXus HDF5 file to convert.
+    
+    Supports two NeXus formats:
+    - Standard NeXus: /entry/ structure with bank*_events (e.g., REF_L, VULCAN)
+    - Mantid processed: /mantid_workspace_*/ structure (e.g., SNAP .lite files)
 
     \b
     Examples:
@@ -62,6 +74,10 @@ def main(input_file: str, output_dir: str, include_events: bool,
       nexus-processor ~/data/REF_L_218389.nxs.h5 --include-events --max-events 100000
       nexus-processor ~/data/REF_L_218389.nxs.h5 --include-events --max-events-per-file 10000000
       nexus-processor ~/data/REF_L_218389.nxs.h5 --include-users
+      
+      # SNAP files (Mantid format, auto-detected)
+      nexus-processor ~/data/SNAP/SNAP_64413.lite.nxs.h5 --include-events
+      nexus-processor ~/data/SNAP/SNAP_64413.lite.nxs.h5 --include-events --max-events-per-file 10000000
     """
     # Determine output directory
     if output_dir is None:
@@ -69,6 +85,9 @@ def main(input_file: str, output_dir: str, include_events: bool,
         if not input_dir:
             input_dir = '.'
         output_dir = os.path.join(input_dir, 'parquet_output')
+
+    # Determine format override
+    force_format = None if format == 'auto' else format
 
     # Process the file
     try:
@@ -79,6 +98,7 @@ def main(input_file: str, output_dir: str, include_events: bool,
             max_events_per_file=max_events_per_file,
             include_events=include_events,
             include_users=include_users,
+            force_format=force_format,
         )
     except Exception as e:
         click.echo(f"Error processing file: {e}", err=True)

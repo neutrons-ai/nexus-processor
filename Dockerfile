@@ -9,6 +9,4 @@ COPY README.md .
 
 RUN pip install --no-cache-dir -e .
 
-ENTRYPOINT ["nexus-processor"]
-
 
